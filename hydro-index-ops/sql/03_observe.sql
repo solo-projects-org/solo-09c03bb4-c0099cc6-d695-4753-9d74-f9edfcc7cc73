@@ -44,3 +44,25 @@ INSERT INTO readings (station_id, observed_at, water_level)
 VALUES (1, now(), 21.500) RETURNING id;
 
 SELECT * FROM readings WHERE station_id = 1 ORDER BY observed_at DESC LIMIT 5;
+
+-- 6. 修订回传与当前观测
+-- 某站某时刻的全部修订原始明细（旧版回传留档）
+SELECT id, revision, water_level, discharge, quality, ingested_at
+FROM readings
+WHERE station_id = 1 AND observed_at = '2030-01-01T00:00:00Z'
+ORDER BY revision;
+
+-- 当前观测（每站每时刻的最高修订）与其指向的原始行是否一致
+SELECT c.station_id, c.observed_at, c.revision, c.water_level AS current_level,
+       r.water_level AS reading_level, r.id AS reading_id
+FROM current_observations c
+JOIN readings r ON r.id = c.reading_id
+ORDER BY c.updated_at DESC
+LIMIT 20;
+
+-- 一致性体检：当前观测指向不存在/不匹配原始行的数量（应恒为 0）
+SELECT count(*) AS inconsistent
+FROM current_observations c
+LEFT JOIN readings r ON r.id = c.reading_id
+WHERE r.id IS NULL OR r.revision IS DISTINCT FROM c.revision
+   OR r.station_id <> c.station_id OR r.observed_at <> c.observed_at;

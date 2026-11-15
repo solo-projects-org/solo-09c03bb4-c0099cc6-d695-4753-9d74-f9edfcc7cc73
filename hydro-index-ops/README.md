@@ -1,8 +1,12 @@
-# 水文数仓 · 水位明细索引运维服务（CREATE INDEX CONCURRENTLY 批次化）
+# 水文数仓 · 水位明细索引运维服务（CREATE INDEX CONCURRENTLY 批次化 + 修订回传）
 
 在持续接收观测的 PostgreSQL `readings` 水位明细表上，以 **`CREATE INDEX CONCURRENTLY`**
 构建普通复合索引 `(station_id, observed_at)`，通过 FastAPI + psycopg3 提供
 **单批次受理、阶段查询、取消、失败/取消清理、重启恢复** 的完整运维闭环。
+
+同时提供**测站迟到回传**能力：以 `(站号, 观测时刻, 修订号)` 识别一笔观测，
+每个首次到达的修订写入原始 `readings`，并在**同一事务**中把该站该时刻的
+**当前观测**推进到已收到的最高修订——分析查询永远拿到最新水位，绝不退回旧值。
 
 ## 为什么这样设计
 
@@ -12,6 +16,9 @@
 - 因此系统用**持久化状态机 + 独立 autocommit 构建会话**驱动批次，保证：
   取消/失败后必须等构建会话结束、残件删净才进入终态，之后才接收新批；
   清理失败保持待处理状态自动重试；重启后先恢复再受理。
+- 修订写入的并发正确性全部交给**数据库约束**（唯一索引 + 条件 upsert +
+  外键 + 单事务），不依赖任何应用层锁，两个 API 实例并发写入、旧修订迟到、
+  写入中途失败时，当前观测都不会回退，也不会指向未提交的原始行。
 
 ## 目录结构
 
@@ -24,17 +31,19 @@ hydro-index-ops/
 │   ├── main.py                 # FastAPI 路由（Swagger: /docs）
 │   ├── worker.py               # 批次状态机：构建/取消/清理/恢复
 │   ├── sql_helpers.py          # 索引状态、CIC 进度、会话终止、批次 CRUD
-│   ├── db.py                   # psycopg 异步连接池 + 批次表 DDL
+│   ├── db.py                   # psycopg 异步连接池 + 批次/修订表 DDL
 │   ├── models.py               # Pydantic 模型
 │   └── config.py               # 环境变量配置
 ├── sql/
-│   ├── 01_init_readings.sql    # 水位样表 + 10 万行样例数据 + 人工索引
+│   ├── 01_init_readings.sql    # 水位样表 + 修订/当前观测表 + 10 万行样例数据 + 人工索引
 │   ├── 02_long_tx.sql          # 长事务样例（制造 CIC 构建等待）
 │   └── 03_observe.sql          # 排障观察 SQL 速查
 ├── demo/
-│   ├── demo.sh                 # 四个端到端演示场景
+│   ├── demo.sh                 # 端到端演示场景
 │   └── reset_index.sql
-└── docs/state-machine.md       # 状态机与关键保证说明
+└── docs/
+    ├── state-machine.md        # 批次状态机与关键保证说明
+    └── revisions.md            # 修订写入与当前观测的语义与并发保证
 ```
 
 ## 快速启动
@@ -60,18 +69,37 @@ curl -s http://localhost:8000/health | python3 -m json.tool
 | GET  | `/index-batches` | 批次历史（状态全部持久化在 `index_build_batches` 表） |
 | GET  | `/index-batches/{id}` | 查状态/构建阶段（pg_stat_progress_create_index）/错误 |
 | POST | `/index-batches/{id}/cancel` | 请求取消，终态前不允许再受理 |
-| POST | `/readings` | 写入水位观测（构建/等待/清理期间始终可用） |
-| GET  | `/readings?station_id=&start=&end=` | 按站号+时间查询 |
+| POST | `/readings` | 写入水位观测（无版本；构建/等待/清理期间始终可用） |
+| GET  | `/readings?station_id=&start=&end=&revision=` | 按站号+时间查询原始明细（含全部修订；可按修订号过滤） |
 | GET  | `/readings/explain?station_id=` | EXPLAIN 验证复合索引是否生效 |
+| POST | `/readings/revisions` | 写入一个修订：首次 201 / 同版同内容重试 200 幂等 / 同版异内容 409 |
+| GET  | `/readings/current?station_id=&observed_at=` | 查询当前观测（每站每时刻已收到的最高修订） |
 | POST | `/demo/long-tx?seconds=` | 开长事务制造 CIC 构建等待 |
 | DELETE | `/demo/long-tx/{pid}` | 结束演示长事务（只认 `hydro-demo-longtx-*` 会话） |
 
-## 四个演示场景
+## 修订写入与当前观测（测站迟到回传）
+
+一笔观测由 **(站号, 观测时刻, 修订号)** 唯一识别，内容包括水位、流量、质量：
+
+- **首次到达的每个修订**都作为一行写入原始 `readings`，并在**同一事务**内
+  把 `current_observations` 中该站该时刻的当前观测推进到已收到的**最高修订**；
+  响应里的 `current` 即提交后的当前值，`current_updated` 表示本次是否推进。
+- **旧版回传仍可查明细**：所有修订都留在 `readings`，
+  `GET /readings?station_id=&start=&end=&revision=` 可查任意旧版原始行。
+- **同版同内容重试幂等**：返回 200 与已存在记录（`deduplicated=true`），
+  不重复入库；**同版内容不同**返回 409 冲突，且不改任何数据。
+- **当前观测只升不降**：较旧修订后到、两个 API 实例并发写入、写入中途失败
+  （整个事务回滚）都不会让当前观测回退；当前观测与原始行同事务提交且
+  `reading_id` 有外键，绝不指向未提交的行。原理见 `docs/revisions.md`。
+- 无版本读写（`POST /readings` / `GET /readings`）行为完全保留：
+  无版本行 `revision` 为 `NULL`，不受修订唯一约束影响。
+
+## 演示场景
 
 ```bash
 chmod +x demo/demo.sh
-./demo/demo.sh all       # 启动并依次跑场景 1~4
-# 或单独执行：./demo/demo.sh 1 | 2 | 3 | 4
+./demo/demo.sh all       # 启动并依次跑场景 1~5
+# 或单独执行：./demo/demo.sh 1 | 2 | 3 | 4 | 5
 ```
 
 1. **构建等待 → 成功**：先开持有 `readings` 快照的长事务，再受理批次；
@@ -87,6 +115,9 @@ chmod +x demo/demo.sh
    不阻塞 API 就绪，先终止遗留构建会话（按 pid + application_name 双重校验，
    不断其他会话）、清净残件再进入终态；另演示孤儿构建迟到成功时索引被采纳
    保留，以及成功索引与人工索引在重启后均不受影响。
+5. **修订回传**：依次提交修订 1 → 3 →（迟到的）2，观察当前观测只升不降；
+   同版同内容重试返回 200 幂等、同版异内容返回 409 且数据不变；
+   最后查询当前观测与全部原始修订明细。
 
 手动排障见 `sql/03_observe.sql`：
 
@@ -126,9 +157,11 @@ docker exec -i hydro-db psql -U hydro -d hydro_warehouse < demo/reset_index.sql
 ## 集成测试（真实 PostgreSQL，非模拟）
 
 `tests/integration_test.py` 启动一个**真实 PG 实例 + 真实 uvicorn 子进程**，
-覆盖 40 项断言：正常构建与执行计划、长事务等待、取消与残件清理、清理失败
+覆盖 77 项断言：正常构建与执行计划、长事务等待、取消与残件清理、清理失败
 自动重试、SIGKILL 崩溃后的后台恢复（含孤儿构建迟到成功的采纳）、成功/人工
-索引保留、批次持久化等。
+索引保留、批次持久化，以及修订写入全语义——首次入库、旧修订迟到不回退、
+同版重试幂等、同版异内容 409、多客户端并发写入（同版/异版/异内容）、
+写入失败零残留、当前观测与原始行一致性、无版本读写兼容。
 
 ```bash
 python -m venv .venv && . .venv/bin/activate

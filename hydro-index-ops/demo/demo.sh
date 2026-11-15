@@ -8,11 +8,12 @@
 #           （取消后的迟到完成不会留索引/报成功）
 #   场景 3  清理失败自动重试（HYDRO_CLEANUP_FAIL_FIRST 注入）
 #   场景 4  API 重启恢复：停遗留构建、清残件；成功索引与人工索引保留
+#   场景 5  测站迟到回传：修订写入、当前观测只升不降、幂等重试与冲突
 #
 # 用法：
 #   ./demo/demo.sh up        # 构建并启动 compose（首次）
-#   ./demo/demo.sh all       # 依次跑场景 1~4（默认）
-#   ./demo/demo.sh 1|2|3|4   # 只跑单个场景
+#   ./demo/demo.sh all       # 依次跑场景 1~5（默认）
+#   ./demo/demo.sh 1|2|3|4|5 # 只跑单个场景
 #
 # 依赖：docker compose、curl、jq（缺失 jq 时脚本自动降级为 python3 -m json.tool）
 # =============================================================================
@@ -276,6 +277,45 @@ scenario4() {
   ok "管理索引 valid、人工索引 idx_readings_ingested_manual 完好"
 }
 
+# --------------------------------------------------------------------------- #
+scenario5() {
+  c "场景 5：测站迟到回传——修订写入与当前观测（只升不降、幂等、冲突）"
+  local T="2030-01-01T00:00:00Z"
+
+  c "5.1 首次收到修订 1 → 201，当前观测 = 修订 1"
+  req POST /readings/revisions \
+    '{"station_id":3,"observed_at":"'"$T"'","revision":1,"water_level":21.5,"discharge":320.5}' \
+    | python3 -m json.tool
+
+  c "5.2 收到更高修订 3 → 当前观测推进到 3"
+  req POST /readings/revisions \
+    '{"station_id":3,"observed_at":"'"$T"'","revision":3,"water_level":21.9,"discharge":330.0,"quality":"SUSPECT"}' \
+    | python3 -m json.tool
+
+  c "5.3 较旧修订 2 迟到 → 明细入库，但当前观测不回退（current_updated=false）"
+  req POST /readings/revisions \
+    '{"station_id":3,"observed_at":"'"$T"'","revision":2,"water_level":21.7}' \
+    | python3 -m json.tool
+
+  c "5.4 同版同内容重试 → 200 幂等（deduplicated=true），不重复入库"
+  curl -s -o /dev/null -w "HTTP %{http_code}\n" -X POST "$BASE/readings/revisions" \
+    -H 'Content-Type: application/json' \
+    -d '{"station_id":3,"observed_at":"'"$T"'","revision":3,"water_level":21.9,"discharge":330.0,"quality":"SUSPECT"}'
+
+  c "5.5 同版内容不同 → 409 冲突，数据不变"
+  curl -s -w "\nHTTP %{http_code}\n" -X POST "$BASE/readings/revisions" \
+    -H 'Content-Type: application/json' \
+    -d '{"station_id":3,"observed_at":"'"$T"'","revision":3,"water_level":99.9}'
+
+  c "5.6 查询当前观测（仍是修订 3）与全部原始修订明细"
+  req GET "/readings/current?station_id=3&observed_at=$T" | python3 -m json.tool
+  req GET "/readings?station_id=3&start=$T&end=$T" \
+    | python3 -c 'import sys, json
+for r in json.load(sys.stdin):
+    print("revision=%s water_level=%s quality=%s" % (r["revision"], r["water_level"], r["quality"]))'
+  ok "修订回传演示完成：当前观测只升不降，旧版明细全部可查"
+}
+
 main() {
   local what="${1:-all}"
   case "$what" in
@@ -284,15 +324,17 @@ main() {
     2) wait_health; scenario2 ;;
     3) wait_health; scenario3 ;;
     4) wait_health; scenario4 ;;
+    5) wait_health; scenario5 ;;
     all)
       up
       scenario1
       scenario2
       scenario3
       scenario4
+      scenario5
       c "全部场景演示完成"
       ;;
-    *) die "用法: $0 [up|all|1|2|3|4]" ;;
+    *) die "用法: $0 [up|all|1|2|3|4|5]" ;;
   esac
 }
 main "$@"

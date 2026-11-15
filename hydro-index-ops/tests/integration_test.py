@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import concurrent.futures
 import os
 import signal
 import subprocess
@@ -341,6 +342,174 @@ async def main() -> int:
     states = {x["state"] for x in batches}
     check("历史覆盖 SUCCEEDED/CANCELLED/FAILED",
           {"SUCCEEDED", "CANCELLED", "FAILED"}.issubset(states), str(states))
+
+    # ------------------------------------------------------------------ #
+    print("场景 6：修订写入与当前观测（迟到回传/幂等重试/冲突/并发不回退）")
+    S = 9
+    T0 = "2030-01-01T00:00:00Z"
+
+    # 清理本场景的历史测试数据（样例数据均在 2026 年之前，2030 起只可能是
+    # 本场景写入的行；先删引用方 current_observations 再删 readings）
+    await pg_exec(
+        "DELETE FROM current_observations WHERE station_id IN (8, 9) "
+        "AND observed_at >= '2030-01-01T00:00:00Z'")
+    await pg_exec(
+        "DELETE FROM readings WHERE station_id IN (8, 9) "
+        "AND observed_at >= '2030-01-01T00:00:00Z'")
+    await pg_exec(
+        "DELETE FROM readings WHERE station_id = 1 "
+        "AND observed_at = '2030-06-01T00:00:00Z'")
+
+    def rev_payload(rev: int, level: float, discharge=None, station: int = S,
+                    t: str = T0, quality: str = "GOOD") -> dict:
+        return {"station_id": station, "observed_at": t, "revision": rev,
+                "water_level": level, "discharge": discharge, "quality": quality}
+
+    def post_rev(payload: dict) -> httpx.Response:
+        return http("POST", "/readings/revisions", json=payload)
+
+    # 首次写入：每个修订都入原始 readings 并推进当前观测
+    r = post_rev(rev_payload(1, 21.5, 320.5))
+    check("修订 1 首次写入 201", r.status_code == 201, r.text)
+    body = r.json()
+    check("当前观测推进到修订 1",
+          body["current_updated"] is True and body["current"]["revision"] == 1,
+          str(body))
+    r = post_rev(rev_payload(3, 21.9, 330.0, quality="SUSPECT"))
+    check("修订 3 首次写入 201", r.status_code == 201, r.text)
+    check("当前观测推进到修订 3",
+          r.json()["current"]["revision"] == 3, r.text)
+
+    # 较旧修订迟到：明细入库，当前观测不回退
+    r = post_rev(rev_payload(2, 21.7))
+    check("迟到旧修订 2 仍入库 201", r.status_code == 201, r.text)
+    body = r.json()
+    check("旧修订不推进当前观测", body["current_updated"] is False, str(body))
+    check("当前观测保持修订 3 水位",
+          body["current"]["revision"] == 3
+          and float(body["current"]["water_level"]) == 21.9, str(body))
+
+    # 当前观测查询（分析查询不退回旧水位）
+    cur = http("GET", f"/readings/current?station_id={S}&observed_at={T0}").json()
+    check("当前观测查询返回最高修订 3",
+          len(cur) == 1 and cur[0]["revision"] == 3, str(cur))
+    check("当前观测指向修订 3 的已提交原始行",
+          cur[0]["reading_id"] == body["current"]["reading_id"], str(cur))
+
+    # 同版同内容重试：幂等，不重复入库
+    r = post_rev(rev_payload(3, 21.9, 330.0, quality="SUSPECT"))
+    check("同版同内容重试返回 200", r.status_code == 200, r.text)
+    check("重试标记 deduplicated", r.json()["deduplicated"] is True, r.text)
+    rows = await pg_exec(
+        "SELECT count(*) FROM readings "
+        "WHERE station_id=%s AND observed_at=%s AND revision=3", (S, T0))
+    check("重试未重复入库（仍 1 行）", rows[0][0] == 1, str(rows))
+
+    # 同版内容不同：409 冲突，原始行与当前观测都不变
+    r = post_rev(rev_payload(3, 99.9))
+    check("同版内容不同返回 409", r.status_code == 409, r.text)
+    rows = await pg_exec(
+        "SELECT water_level, quality FROM readings "
+        "WHERE station_id=%s AND observed_at=%s AND revision=3", (S, T0))
+    check("冲突后原始行内容未变",
+          float(rows[0][0]) == 21.9 and rows[0][1] == "SUSPECT", str(rows))
+    cur = http("GET", f"/readings/current?station_id={S}&observed_at={T0}").json()
+    check("冲突后当前观测未变",
+          cur[0]["revision"] == 3 and float(cur[0]["water_level"]) == 21.9,
+          str(cur))
+
+    # 旧版回传仍可查原始明细（含按修订号过滤）
+    rows = http("GET", f"/readings?station_id={S}&start={T0}&end={T0}&limit=10").json()
+    revs = sorted(x["revision"] for x in rows)
+    check("原始明细含全部 3 个修订", revs == [1, 2, 3], str(revs))
+    rows2 = http("GET", f"/readings?station_id={S}&start={T0}&end={T0}&revision=2").json()
+    check("可按修订号过滤旧版明细",
+          len(rows2) == 1 and rows2[0]["revision"] == 2, str(rows2))
+
+    # 并发同版同内容：恰好一次入库，其余幂等返回
+    T1 = "2030-02-01T00:00:00Z"
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        res = list(ex.map(post_rev, [rev_payload(1, 30.0, t=T1)] * 8))
+    codes = sorted(x.status_code for x in res)
+    check("并发同版同内容：一个 201 其余 200", codes == [200] * 7 + [201], str(codes))
+    rows = await pg_exec(
+        "SELECT count(*) FROM readings "
+        "WHERE station_id=%s AND observed_at=%s AND revision=1", (S, T1))
+    check("并发同版只入库一行", rows[0][0] == 1, str(rows))
+
+    # 并发不同修订（乱序到达）：全部入库，当前观测为最高修订
+    T2 = "2030-02-02T00:00:00Z"
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+        res = list(ex.map(post_rev,
+                          [rev_payload(rv, 40.0 + rv, t=T2)
+                           for rv in (5, 3, 4, 1, 2)]))
+    check("并发不同修订全部 201",
+          all(x.status_code == 201 for x in res), str([x.status_code for x in res]))
+    cur = http("GET", f"/readings/current?station_id={S}&observed_at={T2}").json()
+    check("并发后当前观测为最高修订 5 且不回退",
+          cur[0]["revision"] == 5 and float(cur[0]["water_level"]) == 45.0, str(cur))
+
+    # 并发同版不同内容：恰好一个 201，其余 409，数据与胜者一致
+    T3 = "2030-02-03T00:00:00Z"
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+        res = list(ex.map(post_rev,
+                          [rev_payload(7, 50.0 + i, t=T3) for i in range(6)]))
+    codes = [x.status_code for x in res]
+    check("并发同版不同内容：恰好一个 201", codes.count(201) == 1, str(codes))
+    check("其余全部 409", codes.count(409) == 5, str(codes))
+    winner_level = 50.0 + codes.index(201)
+    rows = await pg_exec(
+        "SELECT water_level FROM readings "
+        "WHERE station_id=%s AND observed_at=%s AND revision=7", (S, T3))
+    check("同版冲突后仅存胜者一行",
+          len(rows) == 1 and float(rows[0][0]) == winner_level, str(rows))
+    cur = http("GET", f"/readings/current?station_id={S}&observed_at={T3}").json()
+    check("当前观测与胜者一致", float(cur[0]["water_level"]) == winner_level, str(cur))
+
+    # 写入失败（测站不存在违反外键）：400，不留任何痕迹，当前观测不变
+    r = post_rev(rev_payload(1, 10.0, station=999))
+    check("不存在测站的修订写入 400", r.status_code == 400, r.text)
+    rows = await pg_exec("SELECT count(*) FROM readings WHERE station_id=999")
+    check("失败写入无残留原始行", rows[0][0] == 0, str(rows))
+    rows = await pg_exec(
+        "SELECT count(*) FROM current_observations WHERE station_id=999")
+    check("失败写入无残留当前观测", rows[0][0] == 0, str(rows))
+
+    # 全库一致性：当前观测绝不指向未提交/不存在的原始行，内容不错位
+    rows = await pg_exec(
+        """
+        SELECT count(*) FROM current_observations c
+        LEFT JOIN readings r ON r.id = c.reading_id
+        WHERE r.id IS NULL OR r.revision IS DISTINCT FROM c.revision
+           OR r.station_id <> c.station_id OR r.observed_at <> c.observed_at
+           OR r.water_level <> c.water_level
+           OR r.discharge IS DISTINCT FROM c.discharge
+           OR r.quality <> c.quality
+        """)
+    check("当前观测与原始行全部一致", rows[0][0] == 0, str(rows))
+
+    # 当前观测列表：按观测时刻倒序，每时刻只出现最高修订
+    cur = http("GET", f"/readings/current?station_id={S}&limit=10").json()
+    check("当前观测列表覆盖多个时刻", len(cur) >= 4, str(len(cur)))
+    ts = [c["observed_at"] for c in cur]
+    check("列表按观测时刻倒序", ts == sorted(ts, reverse=True), str(ts))
+
+    # 无版本读写保留：revision 为 NULL，不受修订约束影响
+    r = http("POST", "/readings", json={
+        "station_id": 1, "observed_at": "2030-06-01T00:00:00Z",
+        "water_level": 19.9})
+    check("无版本写入保留 201", r.status_code == 201, r.text)
+    check("无版本行 revision 为 null", r.json()["revision"] is None, r.text)
+    r = http("POST", "/readings", json={
+        "station_id": 1, "observed_at": "2030-06-01T00:00:00Z",
+        "water_level": 19.9})
+    check("无版本同时刻重复写入不受唯一约束影响", r.status_code == 201, r.text)
+    rows = http(
+        "GET",
+        "/readings?station_id=1&start=2030-06-01T00:00:00Z&end=2030-06-01T00:00:00Z",
+    ).json()
+    check("无版本查询保留", len(rows) == 2
+          and all(x["revision"] is None for x in rows), str(rows))
 
     srv.stop()
     print(f"\n结果：{PASS} passed, {FAIL} failed")

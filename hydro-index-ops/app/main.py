@@ -1,4 +1,4 @@
-"""FastAPI 入口：批次受理/查询/取消、水位明细读写、长事务演示。
+"""FastAPI 入口：批次受理/查询/取消、水位明细读写、修订写入与当前观测、长事务演示。
 
 Swagger UI:  http://localhost:8000/docs
 ReDoc:       http://localhost:8000/redoc
@@ -9,17 +9,27 @@ import asyncio
 import contextlib
 import logging
 import uuid
+from datetime import datetime
 
 import psycopg
 from contextlib import asynccontextmanager
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
 from psycopg_pool import AsyncConnectionPool
 
 from . import db
 from . import sql_helpers as sql
 from .config import settings
 from .db import close_pool, init_pool
-from .models import BatchCreate, BatchOut, LongTxOut, ReadingIn, ReadingOut
+from .models import (
+    BatchCreate,
+    BatchOut,
+    CurrentObservationOut,
+    LongTxOut,
+    ReadingIn,
+    ReadingOut,
+    RevisionIn,
+    RevisionWriteOut,
+)
 from .worker import TERMINAL_STATES, worker
 
 logging.basicConfig(
@@ -56,15 +66,19 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="水文数仓 · 水位明细索引运维 API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "在 PostgreSQL `readings(station_id, observed_at)` 上以 "
-        "**CREATE INDEX CONCURRENTLY** 构建普通复合索引的批次化运维服务。\n\n"
+        "**CREATE INDEX CONCURRENTLY** 构建普通复合索引的批次化运维服务，"
+        "并支持测站迟到回传的**修订写入**。\n\n"
         "- 同一时刻只受理一个批次，可查询构建阶段与错误、可取消；\n"
         "- 取消或失败必须等构建会话结束、索引残件删净才进入终态并接收新批；\n"
         "- 清理失败保留待处理状态并自动重试，期间源表普通读写照常；\n"
         "- 批次状态持久化，重启后先停遗留构建、清残件再接新批；\n"
-        "- 只管理固定名称索引与自有构建会话，不删人工索引、不断其他会话。"
+        "- 只管理固定名称索引与自有构建会话，不删人工索引、不断其他会话；\n"
+        "- 修订写入以 (站号, 观测时刻, 修订号) 识别一笔记录，同一事务内写入\n"
+        "  原始明细并把当前观测推进到最高修订；同版重试幂等、同版异内容 409，\n"
+        "  并发/迟到旧修订/写入失败都不会让当前观测回退或指向未提交行。"
     ),
     lifespan=lifespan,
 )
@@ -249,7 +263,7 @@ async def insert_reading(
                 VALUES (%(station_id)s, %(observed_at)s, %(water_level)s,
                         %(discharge)s, %(quality)s)
                 RETURNING id, station_id, observed_at, water_level, discharge,
-                          quality, ingested_at
+                          quality, revision, ingested_at
                 """,
                 body.model_dump(),
             )
@@ -265,12 +279,13 @@ async def insert_reading(
     "/readings",
     response_model=list[ReadingOut],
     tags=["readings"],
-    summary="按站号+时间查询水位明细（索引建成后走复合索引）",
+    summary="按站号+时间查询水位明细（索引建成后走复合索引；含全部修订原始行）",
 )
 async def query_readings(
     station_id: int = Query(..., description="站号"),
     start: str | None = Query(None, description="起始观测时间 ISO8601"),
     end: str | None = Query(None, description="截止观测时间 ISO8601"),
+    revision: int | None = Query(None, description="按修订号过滤（查旧版回传明细）"),
     limit: int = Query(100, ge=1, le=1000),
     p: AsyncConnectionPool = Depends(get_pool),
 ) -> list[ReadingOut]:
@@ -282,8 +297,12 @@ async def query_readings(
     if end:
         clauses.append("observed_at <= %(end)s")
         params["end"] = end
+    if revision is not None:
+        clauses.append("revision = %(revision)s")
+        params["revision"] = revision
     sql_text = (
-        "SELECT id, station_id, observed_at, water_level, discharge, quality, ingested_at "
+        "SELECT id, station_id, observed_at, water_level, discharge, quality, "
+        "revision, ingested_at "
         "FROM readings WHERE " + " AND ".join(clauses) +
         " ORDER BY observed_at DESC LIMIT %(limit)s"
     )
@@ -316,6 +335,210 @@ async def explain_readings(
         plan = await cur.fetchall()
         await conn.commit()
     return {"plan": plan}
+
+
+# --------------------------------------------------------------------------- #
+# 修订写入与当前观测：测站迟到回传
+#
+# 保证（全部由数据库约束在单事务内落地，多 API 实例并发同样成立）：
+# - 每个首次到达的修订写入原始 readings，并同事务把该站该时刻的当前观测
+#   推进到已收到的最高修订；旧版回传仍留在 readings 可查；
+# - 同版同内容重试幂等（不重复入库，200 返回已存在记录）；
+#   同版内容不同返回 409 且不写任何数据；
+# - 当前观测只升不降：ON CONFLICT ... DO UPDATE ... WHERE revision < 新值，
+#   并发写入与旧修订迟到都不会回退；写入失败整个事务回滚，当前观测不变；
+# - 当前观测与原始行在同一事务提交且 reading_id 有外键，绝不指向未提交行。
+# --------------------------------------------------------------------------- #
+@app.post(
+    "/readings/revisions",
+    response_model=RevisionWriteOut,
+    status_code=status.HTTP_201_CREATED,
+    tags=["revisions"],
+    summary="写入一个修订（同事务更新当前观测为最高修订；同版重试幂等）",
+)
+async def submit_revision(
+    body: RevisionIn,
+    response: Response,
+    p: AsyncConnectionPool = Depends(get_pool),
+) -> RevisionWriteOut:
+    params = body.model_dump()
+    async with p.connection() as conn:
+        try:
+            # 1) 首次收到的修订写入原始 readings；同版重试被唯一索引挡下
+            cur = await conn.execute(
+                """
+                INSERT INTO readings
+                    (station_id, observed_at, revision,
+                     water_level, discharge, quality)
+                VALUES (%(station_id)s, %(observed_at)s, %(revision)s,
+                        %(water_level)s, %(discharge)s, %(quality)s)
+                ON CONFLICT (station_id, observed_at, revision) DO NOTHING
+                RETURNING id, station_id, observed_at, water_level, discharge,
+                          quality, revision, ingested_at
+                """,
+                params,
+            )
+            row = await cur.fetchone()
+
+            if row is None:
+                # 同站同时刻同修订号已入库：同内容 → 幂等返回；不同内容 → 409
+                cur = await conn.execute(
+                    """
+                    SELECT id, station_id, observed_at, water_level, discharge,
+                           quality, revision, ingested_at,
+                           (water_level IS NOT DISTINCT FROM
+                                %(water_level)s::numeric(8,3)
+                            AND discharge IS NOT DISTINCT FROM
+                                %(discharge)s::numeric(12,3)
+                            AND quality IS NOT DISTINCT FROM %(quality)s
+                           ) AS same_content
+                    FROM readings
+                    WHERE station_id = %(station_id)s
+                      AND observed_at = %(observed_at)s
+                      AND revision = %(revision)s
+                    """,
+                    params,
+                )
+                existing = await cur.fetchone()
+                if existing is None:  # pragma: no cover - 并发删除的极端情况
+                    await conn.rollback()
+                    raise HTTPException(
+                        status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        "revision row vanished during conflict check; retry",
+                    )
+                if not existing["same_content"]:
+                    await conn.rollback()  # 不改任何数据
+                    raise HTTPException(
+                        status.HTTP_409_CONFLICT,
+                        detail={
+                            "message": (
+                                f"station {body.station_id} "
+                                f"observed_at {body.observed_at.isoformat()} "
+                                f"revision {body.revision} already exists with "
+                                "different content; no data changed"
+                            ),
+                            "existing": {
+                                "water_level": float(existing["water_level"]),
+                                "discharge": (
+                                    None if existing["discharge"] is None
+                                    else float(existing["discharge"])
+                                ),
+                                "quality": existing["quality"],
+                            },
+                            "received": {
+                                "water_level": body.water_level,
+                                "discharge": body.discharge,
+                                "quality": body.quality,
+                            },
+                        },
+                    )
+                existing.pop("same_content")
+                reading_row = existing
+                deduplicated = True
+                current_updated = False
+            else:
+                # 2) 同一事务内推进当前观测；WHERE 子句 + 行锁序列化保证
+                #    并发写入/旧修订迟到时当前观测绝不回退
+                reading_row = row
+                deduplicated = False
+                cur = await conn.execute(
+                    """
+                    INSERT INTO current_observations AS c
+                        (station_id, observed_at, revision, reading_id,
+                         water_level, discharge, quality, updated_at)
+                    VALUES (%(station_id)s, %(observed_at)s, %(revision)s,
+                            %(reading_id)s, %(water_level)s, %(discharge)s,
+                            %(quality)s, now())
+                    ON CONFLICT (station_id, observed_at) DO UPDATE
+                        SET revision    = EXCLUDED.revision,
+                            reading_id  = EXCLUDED.reading_id,
+                            water_level = EXCLUDED.water_level,
+                            discharge   = EXCLUDED.discharge,
+                            quality     = EXCLUDED.quality,
+                            updated_at  = now()
+                        WHERE c.revision < EXCLUDED.revision
+                    """,
+                    {**params, "reading_id": row["id"]},
+                )
+                current_updated = cur.rowcount > 0
+
+            # 3) 读回当前观测（同事务内，必然指向本次已提交的原始行）
+            cur = await conn.execute(
+                """
+                SELECT station_id, observed_at, revision, reading_id,
+                       water_level, discharge, quality, updated_at
+                FROM current_observations
+                WHERE station_id = %(station_id)s
+                  AND observed_at = %(observed_at)s
+                """,
+                params,
+            )
+            current = await cur.fetchone()
+            if current is None:  # pragma: no cover - 正常流程不可能缺当前行
+                await conn.rollback()
+                raise HTTPException(
+                    status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    "current observation missing after write; retry",
+                )
+            await conn.commit()
+        except HTTPException:
+            raise
+        except psycopg.Error as exc:
+            # 写入失败（如测站不存在违反外键）：整个事务回滚，当前观测不变
+            await conn.rollback()
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+    if deduplicated:
+        response.status_code = status.HTTP_200_OK
+    return RevisionWriteOut(
+        deduplicated=deduplicated,
+        current_updated=current_updated,
+        reading=ReadingOut(**reading_row),
+        current=CurrentObservationOut(**current),
+    )
+
+
+@app.get(
+    "/readings/current",
+    response_model=list[CurrentObservationOut],
+    tags=["revisions"],
+    summary="查询当前观测（每站每时刻已收到的最高修订；分析查询不退回旧水位）",
+)
+async def query_current_observations(
+    station_id: int = Query(..., description="站号"),
+    observed_at: datetime | None = Query(
+        None, description="精确观测时刻 ISO8601（给出时最多返回一条）"
+    ),
+    start: datetime | None = Query(None, description="起始观测时间 ISO8601"),
+    end: datetime | None = Query(None, description="截止观测时间 ISO8601"),
+    limit: int = Query(100, ge=1, le=1000),
+    p: AsyncConnectionPool = Depends(get_pool),
+) -> list[CurrentObservationOut]:
+    clauses = ["station_id = %(station_id)s"]
+    params: dict = {"station_id": station_id, "limit": limit}
+    if observed_at is not None:
+        clauses.append("observed_at = %(observed_at)s")
+        params["observed_at"] = observed_at
+    if start is not None:
+        clauses.append("observed_at >= %(start)s")
+        params["start"] = start
+    if end is not None:
+        clauses.append("observed_at <= %(end)s")
+        params["end"] = end
+    sql_text = (
+        "SELECT station_id, observed_at, revision, reading_id, water_level, "
+        "discharge, quality, updated_at FROM current_observations WHERE "
+        + " AND ".join(clauses)
+        + " ORDER BY observed_at DESC LIMIT %(limit)s"
+    )
+    async with p.connection() as conn:
+        try:
+            cur = await conn.execute(sql_text, params)
+            rows = await cur.fetchall()
+            await conn.commit()
+        except psycopg.Error as exc:
+            await conn.rollback()
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+    return [CurrentObservationOut(**r) for r in rows]
 
 
 # --------------------------------------------------------------------------- #
